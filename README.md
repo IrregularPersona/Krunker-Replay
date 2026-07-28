@@ -1,6 +1,6 @@
-# 3D Replay Engine (Odin + raylib)
+# Krunker Replay Engine (Odin + raylib)
 
-A standalone playback tool for a Krunker-style map file + WebSocket telemetry
+A standalone playback tool for a Krunker map file + WebSocket telemetry
 log, implementing the coordinate system, map schema, and packet protocol.
 
 ## Layout
