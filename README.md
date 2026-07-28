@@ -105,27 +105,27 @@ software-generated geometry do not require additional mod assets.
 
 ## How the spec maps to code
 
-- **Coordinates (§1):** raylib is right-handed, Y-up by default, so no axis
+- **Coordinates (.1):** raylib is right-handed, Y-up by default, so no axis
   remapping is done anywhere — world positions from the JSON are used as-is,
   and `(0,0,0)` is never re-centered.
-- **Player pivot (§1):** telemetry `Y` is feet-level; `draw_players` in
+- **Player pivot (.1):** telemetry `Y` is feet-level; `draw_players` in
   `render.odin` adds `PLAYER_HEIGHT / 2` before drawing the bounding box,
   matching the render-offset formula in the spec.
-- **Map schema (§2):** `gamemap.odin` parses `objects` (center pivot, with
+- **Map schema (.2):** `gamemap.odin` parses `objects` (center pivot, with
   the spec's documented defaults of scale `(10,10,10)` and rotation `(0,0,0)`
   when a real object omits `s`/`r` — which the uploaded `sandstorm_v3.json`
   does for every single object), the flat `xyz` stride-6 array, and `spawns`.
-- **Telemetry protocol (§3):** `replay.odin` parses every log line as
+- **Telemetry protocol (.3):** `replay.odin` parses every log line as
   `[t, [opcode, ...]]` and classifies the six opcodes the spec documents
   (`"0"`, `"chi"`, `"en"`, `"k"`, `"9"`, `"4"`); everything else (chat text,
   shop/session bootstrap packets, etc. — plenty of which show up in the
   `replay_log.2026-07-26`) is parsed once and simply ignored during
   playback. (Note: in the current implementation, most packets are ignored)
-- **Interpolation (§4.3):** `entity.odin`'s `interpolate_players` holds a
+- **Interpolation (.4.3):** `entity.odin`'s `interpolate_players` holds a
   ~100ms jitter buffer (`DEFAULT_JITTER_MS`) and LERPs position / does
   shortest-path angle interpolation between the two 40Hz `"k"` snapshots
   bracketing the delayed render time.
-- **Combat visualization (§4.4):** bullet tracers (`"9"`) are kept for
+- **Combat visualization (.4.4):** bullet tracers (`"9"`) are kept for
   `TRACER_LIFETIME_MS` and drawn as fading 3D line segments; `"4"` packets
   set a timestamp (`World.last_hit_t`) intended for a HUD hit-marker flash.
 
