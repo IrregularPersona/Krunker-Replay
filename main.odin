@@ -1,8 +1,17 @@
 package main
 
-// Standalone 3D replay engine: loads a map file (spec section 2) and plays
-// back a WebSocket telemetry log (spec section 3) with jitter-buffered
+// Standalone 2D top-down replay engine: loads a map file (spec section 2) and
+// plays back a WebSocket telemetry log (spec section 3) with jitter-buffered
 // snapshot interpolation (spec section 4).
+//
+// This is the 2D sibling of the 3D replay engine: instead of a free-fly 3D
+// camera walking an extruded world, everything is projected straight down
+// onto the XZ ground plane and viewed through a pannable/zoomable 2D camera.
+// That sidesteps every "getting the 3D right" problem the 3D version had
+// (prop mesh loading/asset paths, matrix rotation order, camera-in-geometry
+// weirdness) at the cost of losing true verticality: overlapping floors at
+// different world Y will draw on top of each other rather than being
+// properly layered. See world_to_2d in render.odin.
 //
 // Usage:
 //   odin run replay_engine -- data/sandstorm_v3.json data/replay_log.2026-07-26
@@ -16,15 +25,16 @@ import rl "vendor:raylib"
 DEFAULT_MAP_PATH    :: "data/sandstorm_v3.json"
 DEFAULT_REPLAY_PATH :: "data/replay_log.2026-07-26"
 
-// raylib's built-in FREE camera has no movement-speed parameter. Updating it
-// three times per frame gives the replay camera roughly 3x its normal WASD
-// and mouse-look speed while preserving raylib's camera behavior.
-CAMERA_SPEED_MULTIPLIER :: 10
+CAMERA_PAN_SPEED :: 400.0 // world units/sec at zoom = 1x, scaled by 1/zoom so WASD panning feels constant on screen
+ZOOM_SPEED       :: 0.12  // fraction of current zoom applied per mouse-wheel notch
+MIN_ZOOM         :: 0.02
+MAX_ZOOM         :: 12.0
 
-// Referenced by render.odin (draw_players) to project world -> screen space
-// for name tags. Kept as a package-level global since raylib's own camera
-// is likewise a single active camera per frame.
-current_camera: rl.Camera3D
+// Referenced by render.odin (draw_player_labels, draw_overview) to project
+// world -> screen space for name tags and the viewport-overview box. Kept as
+// a package-level global for the same reason the 3D version kept one:
+// raylib only has a single active camera per frame anyway.
+current_camera: rl.Camera2D
 
 main :: proc() {
 	map_path := DEFAULT_MAP_PATH
@@ -46,14 +56,10 @@ main :: proc() {
 	}
 
 	rl.SetConfigFlags({.MSAA_4X_HINT, .WINDOW_RESIZABLE})
-	rl.InitWindow(1280, 800, "3D Replay Engine")
+	rl.InitWindow(1280, 800, "2D Replay Engine")
 	rl.SetTargetFPS(144)
 	defer rl.CloseWindow()
 
-	// Model/texture loading must happen after InitWindow.  make_world loads
-	// the prop assets, and raylib needs the OpenGL context created above for
-	// those GPU resources.  Loading it earlier produces "GPU is not ready"
-	// warnings and can segfault in the platform GL driver.
 	world := make_world(game_map, replay)
 	seek_to(&world, 0)
 	world.playing = true
@@ -65,21 +71,10 @@ main :: proc() {
 	rl.SetWindowSize(rl.GetMonitorWidth(monitor), rl.GetMonitorHeight(monitor))
 	rl.SetWindowPosition(0, 0)
 
-	// Start the free-fly camera above the first spawn, looking at the map center.
-	start_pos := rl.Vector3{0, 60, 60}
-	if len(game_map.spawns) > 0 {
-		s := game_map.spawns[0]
-		start_pos = rl.Vector3{s.pos.x, s.pos.y + 40, s.pos.z + 40}
-	}
-	camera := rl.Camera3D{
-		position   = start_pos,
-		target     = rl.Vector3{0, 0, 0},
-		up         = rl.Vector3{0, 1, 0},
-		fovy       = 70,
-		projection = .PERSPECTIVE,
-	}
-	cursor_locked := true
-	rl.DisableCursor()
+	// Frame the whole map on startup rather than starting zoomed into an
+	// arbitrary corner -- computed after the window resize above so it uses
+	// the real screen size, not the 1280x800 default.
+	camera := make_initial_camera(&game_map)
 
 	for !rl.WindowShouldClose() {
 		dt := rl.GetFrameTime()
@@ -88,36 +83,23 @@ main :: proc() {
 			rl.ToggleFullscreen()
 		}
 
-		if rl.IsKeyPressed(.TAB) {
-			cursor_locked = !cursor_locked
-			if cursor_locked {
-				rl.DisableCursor()
-			} else {
-				rl.EnableCursor()
-			}
-		}
-
-		handle_input(&world, &camera)
+		handle_input(&world, &camera, dt)
 
 		current_camera = camera
-		if cursor_locked {
-			for _ in 0..<CAMERA_SPEED_MULTIPLIER {
-				rl.UpdateCamera(&camera, .FREE)
-			}
-		}
-
 		update_playback(&world, dt)
 
 		rl.BeginDrawing()
 		rl.ClearBackground(rl.Color{18, 20, 26, 255})
 
-		rl.BeginMode3D(camera)
-		rl.DrawGrid(200, 10)
-		draw_map(&game_map, camera.position, world.render_distance, &world.prop_models)
+		rl.BeginMode2D(camera)
+		draw_map(&game_map)
 		draw_players(&world)
 		draw_tracers(&world)
-		rl.EndMode3D()
+		rl.EndMode2D()
 
+		// Name tags are drawn after EndMode2D so text stays a constant
+		// screen size regardless of zoom (see draw_player_labels).
+		draw_player_labels(&world)
 		draw_hud(&world, camera)
 
 		rl.EndDrawing()
@@ -125,10 +107,36 @@ main :: proc() {
 
 	destroy_map(&game_map)
 	destroy_replay(&replay)
-	destroy_prop_models(&world.prop_models)
 }
 
-handle_input :: proc(w: ^World, camera: ^rl.Camera3D) {
+// Centers the camera on the map's bounds and picks a zoom level that fits
+// the whole map on screen, with a little padding.
+make_initial_camera :: proc(m: ^GameMap) -> rl.Camera2D {
+	sw := f32(rl.GetScreenWidth())
+	sh := f32(rl.GetScreenHeight())
+	if sw <= 0 do sw = 1280
+	if sh <= 0 do sh = 800
+
+	width := m.bounds_max.x - m.bounds_min.x
+	depth := m.bounds_max.z - m.bounds_min.z
+	if width <= 0 do width = 1
+	if depth <= 0 do depth = 1
+
+	zoom := min(sw / width, sh / depth) * 0.9
+	zoom = clamp_f32(zoom, MIN_ZOOM, MAX_ZOOM)
+
+	center_x := (m.bounds_min.x + m.bounds_max.x) / 2
+	center_z := (m.bounds_min.z + m.bounds_max.z) / 2
+
+	return rl.Camera2D{
+		target   = rl.Vector2{center_x, center_z},
+		offset   = rl.Vector2{sw / 2, sh / 2},
+		rotation = 0,
+		zoom     = zoom,
+	}
+}
+
+handle_input :: proc(w: ^World, camera: ^rl.Camera2D, dt: f32) {
 	if rl.IsKeyPressed(.SPACE) {
 		w.playing = !w.playing
 	}
@@ -147,16 +155,52 @@ handle_input :: proc(w: ^World, camera: ^rl.Camera3D) {
 	if rl.IsKeyPressed(.DOWN) {
 		w.speed = clamp_f32(w.speed - 0.25, 0.25, 4.0)
 	}
-	if rl.IsKeyDown(.LEFT_BRACKET) {
-		w.render_distance = clamp_f32(w.render_distance - 200 * rl.GetFrameTime(), 30, 2000)
-	}
-	if rl.IsKeyDown(.RIGHT_BRACKET) {
-		w.render_distance = clamp_f32(w.render_distance + 200 * rl.GetFrameTime(), 30, 2000)
-	}
 	if rl.IsKeyPressed(.P) {
-		debug_pick(&w.game_map, camera^, &w.prop_models)
+		debug_pick(&w.game_map, camera^)
 	}
+
+	handle_camera_pan(camera, dt)
+	handle_camera_zoom(camera)
 	handle_timeline_click(w)
+}
+
+// WASD and right-mouse-drag both pan the camera. Pan speed (both the WASD
+// constant-speed case and the mouse-drag case) is divided by zoom so a
+// screen-space drag tracks the cursor 1:1 and WASD feels the same speed
+// regardless of how zoomed in you are.
+handle_camera_pan :: proc(camera: ^rl.Camera2D, dt: f32) {
+	move := rl.Vector2{0, 0}
+	if rl.IsKeyDown(.W) do move.y -= 1
+	if rl.IsKeyDown(.S) do move.y += 1
+	if rl.IsKeyDown(.A) do move.x -= 1
+	if rl.IsKeyDown(.D) do move.x += 1
+	if move.x != 0 || move.y != 0 {
+		move = rl.Vector2Normalize(move)
+		delta := rl.Vector2Scale(move, (CAMERA_PAN_SPEED / camera.zoom) * dt)
+		camera.target = rl.Vector2Add(camera.target, delta)
+	}
+
+	if rl.IsMouseButtonDown(.RIGHT) {
+		mouse_delta := rl.GetMouseDelta()
+		camera.target.x -= mouse_delta.x / camera.zoom
+		camera.target.y -= mouse_delta.y / camera.zoom
+	}
+}
+
+// Mouse-wheel zoom, pinned to whatever world point is under the cursor
+// (rather than always zooming toward screen center) so you don't drift
+// away from what you're looking at while zooming in.
+handle_camera_zoom :: proc(camera: ^rl.Camera2D) {
+	wheel := rl.GetMouseWheelMove()
+	if wheel == 0 do return
+
+	mouse_world_before := rl.GetScreenToWorld2D(rl.GetMousePosition(), camera^)
+	new_zoom := camera.zoom * (1.0 + wheel * ZOOM_SPEED)
+	camera.zoom = clamp_f32(new_zoom, MIN_ZOOM, MAX_ZOOM)
+	mouse_world_after := rl.GetScreenToWorld2D(rl.GetMousePosition(), camera^)
+
+	camera.target.x += mouse_world_before.x - mouse_world_after.x
+	camera.target.y += mouse_world_before.y - mouse_world_after.y
 }
 
 clamp_f32 :: proc(v, lo, hi: f32) -> f32 {

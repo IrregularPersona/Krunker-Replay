@@ -2,13 +2,17 @@ package main
 
 // Entity management, jitter-buffered snapshot interpolation, and playback
 // control, per SYSTEM CONTEXT & SPECIFICATION section 4.
+//
+// Unchanged from the 3D version except for World: render_distance and
+// prop_models are gone, since the 2D top-down renderer doesn't cull by
+// distance (a few thousand flat rects is cheap) and doesn't load meshes.
 
 import "core:encoding/json"
 import "core:fmt"
 import rl "vendor:raylib"
 
 PLAYER_WIDTH        :: 4.0
-PLAYER_HEIGHT       :: 11.0
+PLAYER_HEIGHT       :: 11.0 // unused for drawing now (no height axis), kept for reference/spec fidelity
 PLAYER_DEPTH        :: 4.0
 TRACER_LIFETIME_MS  :: 150.0
 DEFAULT_JITTER_MS   :: 100
@@ -55,15 +59,7 @@ World :: struct {
 
 	event_cursor: int,
 	last_hit_t:   i64,
-
-	// Distance-based culling radius (world units) for map geometry, and the
-	// loaded custom prop meshes (barrel/crate/powercell) keyed by the map's
-	// `i` field -- see models.odin.
-	render_distance: f32,
-	prop_models:     PropModels,
 }
-
-DEFAULT_RENDER_DISTANCE :: 300.0
 
 make_world :: proc(m: GameMap, r: Replay) -> World {
 	w: World
@@ -72,8 +68,6 @@ make_world :: proc(m: GameMap, r: Replay) -> World {
 	w.players = make(map[string]PlayerEntity)
 	w.speed = 1.0
 	w.jitter_ms = DEFAULT_JITTER_MS
-	w.render_distance = DEFAULT_RENDER_DISTANCE
-	w.prop_models = load_prop_models(&w.game_map)
 	return w
 }
 

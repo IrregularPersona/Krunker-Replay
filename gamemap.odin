@@ -26,10 +26,18 @@ MapObject :: struct {
 	pos:      rl.Vector3, // center
 	scale:    rl.Vector3, // width, height, depth (only meaningful for the box fallback)
 	rot:      rl.Vector3, // euler radians, XYZ order
-	obj_type: int,        // the spec's "t" field
+	obj_type: int,        // the spec's "t" field -- NOT a shape type: it's a texture-slot
+	                      // index (wall/dirt/floor/grid/brick/...), only meaningful for
+	                      // objects that don't map to a named mesh. See KrunkNative's
+	                      // client/src/prefab.c for the real 16-entry texture table.
 	color_i:  int,        // index into GameMap.colors ("ci"), -1 if absent
-	prop_i:   int,        // imported-model category ("i"), -1 if absent -- see models.odin
+	prop_i:   int,        // the real object/shape type ("i", falling back to "id") --
+	                      // this is KrunkNative's full PrefabType enum (cube, ramp,
+	                      // ladder, cylinder, trigger, zones, ... as well as the named
+	                      // mesh props). Defaults to 0 (cube) per spec when both are absent.
 	model_size: f32,      // per-instance model scale override ("ms"), -1 if absent
+	hidden:   bool,       // "v" == 1: mapmaker explicitly hid this object (still exists
+	                      // for collision/gameplay, but shouldn't be drawn)
 }
 
 // One stride of the flat `xyz` terrain array: also a *center* pivot box.
@@ -151,7 +159,7 @@ load_map :: proc(path: string) -> (GameMap, bool) {
 			obj.scale = rl.Vector3{10, 10, 10} // spec default
 			obj.rot = rl.Vector3{0, 0, 0}      // spec default
 			obj.color_i = -1
-			obj.prop_i = -1
+			obj.prop_i = 0 // spec default: prefab id is 0 (cube) when neither "i" nor "id" is set
 			obj.model_size = -1
 
 			if pv, has_p := oo["p"]; has_p {
@@ -174,9 +182,14 @@ load_map :: proc(path: string) -> (GameMap, bool) {
 			}
 			if iv, has_i := oo["i"]; has_i {
 				obj.prop_i = int(get_i64(iv))
+			} else if idv, has_id := oo["id"]; has_id {
+				obj.prop_i = int(get_i64(idv))
 			}
 			if msv, has_ms := oo["ms"]; has_ms {
 				obj.model_size = get_f32(msv)
+			}
+			if vv, has_v := oo["v"]; has_v {
+				obj.hidden = get_i64(vv) == 1
 			}
 			append(&m.objects, obj)
 			expand_bounds(&m, obj.pos)

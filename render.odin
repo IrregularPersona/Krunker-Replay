@@ -3,90 +3,135 @@ package main
 import "core:fmt"
 import "core:math"
 import rl "vendor:raylib"
-import rlgl "vendor:raylib/rlgl"
+
+TEAM_COLORS := [3]rl.Color{rl.SKYBLUE, rl.ORANGE, rl.LIME}
 
 deg_to_rad :: proc(d: f32) -> f32 {
 	return d * 0.017453292
 }
 
-TEAM_COLORS := [3]rl.Color{rl.SKYBLUE, rl.ORANGE, rl.LIME}
-
-dist_sq_xz :: proc(a, b: rl.Vector3) -> f32 {
-	dx := a.x - b.x
-	dz := a.z - b.z
-	return dx * dx + dz * dz
+// Projects a world position onto the top-down view: world X stays screen X,
+// world Z becomes screen Y. World Y (height) is dropped entirely -- this is
+// the one thing the 2D version can't represent that the 3D version could.
+// Maps with real verticality (stacked floors, ramps) will draw everything
+// at those different heights on top of each other with no depth cue.
+world_to_2d :: proc(pos: rl.Vector3) -> rl.Vector2 {
+	return rl.Vector2{pos.x, pos.z}
 }
 
-// Draws a box centered at `pos`, rotated by euler `rot` (radians, XYZ order)
-// using raylib's immediate-mode matrix stack, since DrawCube itself has no
-// rotation parameter.
-draw_rotated_box :: proc(pos: rl.Vector3, size: rl.Vector3, rot: rl.Vector3, color: rl.Color, wire: bool) {
-	rlgl.PushMatrix()
-	rlgl.Translatef(pos.x, pos.y, pos.z)
-	rlgl.Rotatef(rot.z * rl.RAD2DEG, 0, 0, 1)
-	rlgl.Rotatef(rot.y * rl.RAD2DEG, 0, 1, 0)
-	rlgl.Rotatef(rot.x * rl.RAD2DEG, 1, 0, 0)
-	rl.DrawCube(rl.Vector3{0, 0, 0}, size.x, size.y, size.z, color)
+// Rotated top-down rectangle, filled + optional outline. `rot_y` is the only
+// rotation axis that means anything from directly above, so tilt/roll (the
+// object's rot.x/rot.z) are silently dropped, same as height.
+draw_top_down_rect :: proc(center: rl.Vector2, width, depth, rot_y: f32, color: rl.Color, wire: bool) {
+	rec := rl.Rectangle{center.x, center.y, width, depth}
+	origin := rl.Vector2{width / 2, depth / 2}
+	// Screen Y mirrors world Z, so flip rotation direction to keep "yaw"
+	// meaning the same thing it does in the telemetry data.
+	deg := -rot_y * rl.RAD2DEG
+	rl.DrawRectanglePro(rec, origin, deg, color)
 	if wire {
-		rl.DrawCubeWires(rl.Vector3{0, 0, 0}, size.x, size.y, size.z, rl.Color{0, 0, 0, 90})
+		draw_rect_outline_rotated(center, width, depth, deg, rl.Color{0, 0, 0, 90})
 	}
-	rlgl.PopMatrix()
 }
 
-// Draws the map, culling anything farther than `render_distance` (XZ plane
-// distance -- height differences shouldn't hide/show geometry) from
-// `camera_pos`. This is the fix for "too many objects": with ~1360 objects
-// and 300 terrain blocks, drawing everything regardless of distance both
-// tanks performance and makes the view unreadable.
-draw_map :: proc(m: ^GameMap, camera_pos: rl.Vector3, render_distance: f32, prop_models: ^PropModels) {
-	max_d_sq := render_distance * render_distance
+// DrawRectangleLinesEx can't rotate, so for anything with a real rotation
+// this rotates the 4 corners by hand and connects them with lines.
+draw_rect_outline_rotated :: proc(center: rl.Vector2, width, depth, deg: f32, color: rl.Color) {
+	rad := deg * rl.DEG2RAD
+	hw, hd := width / 2, depth / 2
+	local := [4]rl.Vector2{{-hw, -hd}, {hw, -hd}, {hw, hd}, {-hw, hd}}
+	cos_r := math.cos(rad)
+	sin_r := math.sin(rad)
 
+	corners: [4]rl.Vector2
+	for p, i in local {
+		corners[i] = rl.Vector2{
+			center.x + p.x * cos_r - p.y * sin_r,
+			center.y + p.x * sin_r + p.y * cos_r,
+		}
+	}
+	for i in 0 ..< 4 {
+		rl.DrawLineV(corners[i], corners[(i + 1) % 4], color)
+	}
+}
+
+// Prefab-type indices (KrunkNative's PrefabType enum) that are gameplay
+// logic/markers in the real client -- zones, triggers, pickups, spawn/camera
+// markers, VFX emitters -- not physical geometry a player would ever see as
+// a shape. Mapmakers often additionally (or instead) mark these with "v":1
+// (see MapObject.hidden), but plenty rely on the type alone being invisible
+// in the stock client, so we skip both. Tune this against the in-game
+// minimap: press P over a stray box to read its real `i` value.
+LOGICAL_PREFAB_TYPES := map[int]bool{
+	5  = true, // spawn point (we draw real spawn markers from `spawns` instead)
+	6  = true, // camera position
+	10 = true, // score zone
+	12 = true, // death zone
+	13 = true, // particles
+	14 = true, // objective
+	23 = true, // flag
+	24 = true, // gate
+	25 = true, // check point
+	26 = true, // weapon pickup
+	27 = true, // teleporter
+	29 = true, // trigger
+	31 = true, // deposit box
+	32 = true, // light cone
+	33 = true, // spectate cam
+	35 = true, // placeholder
+	39 = true, // sound emitter
+	40 = true, // event
+	41 = true, // terminal
+	42 = true, // premium zone
+	43 = true, // verified zone
+	44 = true, // custom asset
+	45 = true, // bomb site
+	46 = true, // boost pad
+	47 = true, // team zone
+	52 = true, // showcase
+	53 = true, // point light
+	55 = true, // bot
+	57 = true, // rune
+}
+
+should_draw_object :: proc(o: MapObject) -> bool {
+	if o.hidden do return false
+	if LOGICAL_PREFAB_TYPES[o.prop_i] do return false
+	return true
+}
+
+// Draws every block/object flat, from directly above. No distance culling:
+// even ~1360 objects + 300 blocks as simple 2D rects is cheap -- unlike the
+// 3D version, which had to cull real meshes to hold a frame rate.
+draw_map :: proc(m: ^GameMap) {
 	block_color := rl.Color{130, 120, 110, 255}
 	for b in m.blocks {
-		if dist_sq_xz(b.pos, camera_pos) > max_d_sq do continue
-		rl.DrawCube(b.pos, b.size.x, b.size.y, b.size.z, block_color)
-		rl.DrawCubeWires(b.pos, b.size.x, b.size.y, b.size.z, rl.Color{0, 0, 0, 60})
+		draw_top_down_rect(world_to_2d(b.pos), b.size.x, b.size.z, 0, block_color, true)
 	}
 
 	for o in m.objects {
-		if dist_sq_xz(o.pos, camera_pos) > max_d_sq do continue
+		if !should_draw_object(o) do continue
 
-		// A real imported prop mesh (barrel/crate) takes priority over the
-		// generic colored-box fallback when we have one loaded. Krunker
-		// scales these by a fixed per-prefab constant (crate=6.0,
-		// barrel=4.0), not the object's "s" field -- overridden per
-		// instance only if the map sets "ms" (model_size). Position is the
-		// mesh's *base*, not its center, so we shift it up by the mesh's
-		// own bounding-box offset (computed once at load time).
-		if o.prop_i >= 0 {
-			if asset, has_model := prop_models[o.prop_i]; has_model {
-				s := asset.scale
-				if o.model_size > 0 do s = o.model_size
-
-				// NOTE: matrix multiplication order for raylib's row-vector
-				// convention -- if props render rotated/offset incorrectly,
-				// this is the first thing to flip (try MatrixMultiply args
-				// reversed, or swap which transform the scale factor lands on).
-				base_lift := rl.MatrixTranslate(0, asset.base_offset_y * s, 0)
-				rot := rl.MatrixRotateXYZ(o.rot)
-				scale_m := rl.MatrixScale(s, s, s)
-				asset.model.transform = rl.MatrixMultiply(rl.MatrixMultiply(scale_m, rot), base_lift)
-
-				rl.DrawModel(asset.model, o.pos, 1.0, rl.WHITE)
-				continue
-			}
-		}
-
+		// No prop meshes in the 2D version -- barrels/crates/etc just draw
+		// as their real map color, same as any other object. See
+		// debug_pick below if you want to identify a prop's `i` value.
 		col := object_color(m, o.color_i)
-		draw_rotated_box(o.pos, o.scale, o.rot, col, true)
+		draw_top_down_rect(world_to_2d(o.pos), o.scale.x, o.scale.z, o.rot.y, col, true)
 	}
 
 	for s in m.spawns {
 		col := TEAM_COLORS[s.team % len(TEAM_COLORS)]
-		rl.DrawCylinder(s.pos, 3, 3, 0.2, 12, col)
+		center := world_to_2d(s.pos)
+		rl.DrawCircleV(center, 3, col)
+		// Facing tick, same idea as the 3D version's spawn markers.
+		dir := rl.Vector2{math.sin(s.rot_y), math.cos(s.rot_y)}
+		tip := rl.Vector2{center.x + dir.x * 6, center.y + dir.y * 6}
+		rl.DrawLineV(center, tip, col)
 	}
 }
 
+// Player bodies + facing indicators. Called inside BeginMode2D, so these
+// scale/pan with the camera like any other world geometry.
 draw_players :: proc(w: ^World) {
 	for sid, _ in w.players {
 		p := &w.players[sid]
@@ -94,24 +139,32 @@ draw_players :: proc(w: ^World) {
 			continue
 		}
 
-		// Render offset per spec 1: packet Y is feet level, box origin is center.
-		center := rl.Vector3{p.render_pos.x, p.render_pos.y + PLAYER_HEIGHT / 2, p.render_pos.z}
-
+		center := world_to_2d(p.render_pos)
 		body_color := rl.Color{80, 200, 255, 255}
 		if p.health <= 0 {
 			body_color = rl.Color{90, 90, 90, 160}
 		}
 
-		draw_rotated_box(center, rl.Vector3{PLAYER_WIDTH, PLAYER_HEIGHT, PLAYER_DEPTH}, rl.Vector3{0, deg_to_rad(p.render_yaw), 0}, body_color, true)
-
-		// Facing indicator: small nose poking out in view direction.
 		yaw_rad := deg_to_rad(p.render_yaw)
-		nose := rl.Vector3{center.x + math.sin(yaw_rad) * 3, center.y, center.z + math.cos(yaw_rad) * 3}
-		rl.DrawLine3D(center, nose, rl.RED)
+		draw_top_down_rect(center, PLAYER_WIDTH, PLAYER_DEPTH, yaw_rad, body_color, true)
 
+		nose := rl.Vector2{center.x + math.sin(yaw_rad) * 6, center.y + math.cos(yaw_rad) * 6}
+		rl.DrawLineV(center, nose, rl.RED)
+	}
+}
+
+// Name tags, drawn *outside* BeginMode2D (see main.odin) so text stays a
+// constant screen size regardless of zoom -- the 2D equivalent of the 3D
+// version's manual GetWorldToScreen conversion for the same reason.
+draw_player_labels :: proc(w: ^World) {
+	for sid, _ in w.players {
+		p := &w.players[sid]
+		if !p.has_render || p.is_spectator {
+			continue
+		}
+		screen := rl.GetWorldToScreen2D(world_to_2d(p.render_pos), current_camera)
 		label := fmt.ctprintf("%s (%d)", p.name, p.health)
-		screen := rl.GetWorldToScreen(rl.Vector3{center.x, center.y + PLAYER_HEIGHT / 2 + 2, center.z}, current_camera)
-		rl.DrawText(label, i32(screen.x) - 40, i32(screen.y), 16, rl.WHITE)
+		rl.DrawText(label, i32(screen.x) - 40, i32(screen.y) - 22, 16, rl.WHITE)
 	}
 }
 
@@ -123,11 +176,11 @@ draw_tracers :: proc(w: ^World) {
 			continue
 		}
 		alpha := u8(255.0 * (1.0 - age / TRACER_LIFETIME_MS))
-		rl.DrawLine3D(tr.start, tr.end, rl.Color{255, 230, 120, alpha})
+		rl.DrawLineV(world_to_2d(tr.start), world_to_2d(tr.end), rl.Color{255, 230, 120, alpha})
 	}
 }
 
-draw_hud :: proc(w: ^World, camera: rl.Camera3D) {
+draw_hud :: proc(w: ^World, camera: rl.Camera2D) {
 	sw := rl.GetScreenWidth()
 	sh := rl.GetScreenHeight()
 
@@ -149,75 +202,70 @@ draw_hud :: proc(w: ^World, camera: rl.Camera3D) {
 		state = "PLAYING"
 	}
 	info := fmt.ctprintf(
-		"%s  |  t = %.1fs / %.1fs  |  speed = %.2fx  |  players = %d  |  render dist = %.0f ([ / ] to adjust)",
+		"%s  |  t = %.1fs / %.1fs  |  speed = %.2fx  |  players = %d  |  zoom = %.2fx",
 		state,
 		w.playback_t / 1000.0,
 		f64(w.replay.duration) / 1000.0,
 		w.speed,
 		len(w.players),
-		w.render_distance,
+		camera.zoom,
 	)
 	rl.DrawText(info, bar_x, bar_y - 22, 18, rl.WHITE)
 
-	help: cstring = "SPACE play/pause  LEFT/RIGHT seek 2s  UP/DOWN speed  [ ] render distance  P inspect nearest prop  TAB release mouse  F11 fullscreen  WASD+Mouse fly"
+	help: cstring = "SPACE play/pause  LEFT/RIGHT seek 2s  UP/DOWN speed  WASD/right-drag pan  wheel zoom  P inspect nearest object  F11 fullscreen"
 	rl.DrawText(help, bar_x, sh - 22, 14, rl.Color{200, 200, 200, 255})
 
 	draw_position_hud(camera)
-	draw_minimap(w, camera)
+	draw_overview(w, camera)
 }
 
-// Top-left readout of where the camera actually is in world space -- the
-// spec's world origin (0,0,0) is fixed and never re-centered, so these
-// numbers line up directly with map/spawn coordinates.
-draw_position_hud :: proc(camera: rl.Camera3D) {
+// Top-left readout of where the 2D camera is looking and how zoomed in it is.
+draw_position_hud :: proc(camera: rl.Camera2D) {
 	pos_text := fmt.ctprintf(
-		"pos: (%.0f, %.0f, %.0f)   dist to origin: %.0f",
-		camera.position.x, camera.position.y, camera.position.z,
-		math.sqrt(camera.position.x * camera.position.x + camera.position.z * camera.position.z),
+		"viewing: (%.0f, %.0f)   zoom: %.2fx",
+		camera.target.x, camera.target.y, camera.zoom,
 	)
 	rl.DrawText(pos_text, 20, 20, 18, rl.WHITE)
 }
 
-MINIMAP_SIZE   :: 220
-MINIMAP_MARGIN :: 20
+OVERVIEW_SIZE   :: 220
+OVERVIEW_MARGIN :: 20
 
-world_to_minimap :: proc(m: ^GameMap, origin_x, origin_y: i32, wx, wz: f32) -> (i32, i32) {
+world_to_overview :: proc(m: ^GameMap, origin_x, origin_y: i32, wx, wz: f32) -> (i32, i32) {
 	width := m.bounds_max.x - m.bounds_min.x
 	depth := m.bounds_max.z - m.bounds_min.z
 	if width <= 0 do width = 1
 	if depth <= 0 do depth = 1
 	fx := (wx - m.bounds_min.x) / width
 	fz := (wz - m.bounds_min.z) / depth
-	return origin_x + i32(fx * MINIMAP_SIZE), origin_y + i32(fz * MINIMAP_SIZE)
+	return origin_x + i32(fx * OVERVIEW_SIZE), origin_y + i32(fz * OVERVIEW_SIZE)
 }
 
-// Top-down overview: map bounds, spawn points (colored by team), and the
-// camera's position + facing -- the fix for "no idea where I am".
-draw_minimap :: proc(w: ^World, camera: rl.Camera3D) {
+// Whole-map overview with spawn points and a rectangle showing what part of
+// the map the main view currently covers. The 3D version's minimap existed
+// to answer "where am I"; here the main view *is* the map, so this instead
+// answers "how much of the map am I currently zoomed into".
+draw_overview :: proc(w: ^World, camera: rl.Camera2D) {
 	m := &w.game_map
 	sw := rl.GetScreenWidth()
-	x0 := sw - MINIMAP_SIZE - MINIMAP_MARGIN
-	y0 := i32(MINIMAP_MARGIN)
+	sh := rl.GetScreenHeight()
+	x0 := sw - OVERVIEW_SIZE - OVERVIEW_MARGIN
+	y0 := i32(OVERVIEW_MARGIN)
 
-	rl.DrawRectangle(x0, y0, MINIMAP_SIZE, MINIMAP_SIZE, rl.Color{20, 20, 25, 210})
-	rl.DrawRectangleLines(x0, y0, MINIMAP_SIZE, MINIMAP_SIZE, rl.WHITE)
+	rl.DrawRectangle(x0, y0, OVERVIEW_SIZE, OVERVIEW_SIZE, rl.Color{20, 20, 25, 210})
+	rl.DrawRectangleLines(x0, y0, OVERVIEW_SIZE, OVERVIEW_SIZE, rl.WHITE)
 
 	for s in m.spawns {
-		sx, sy := world_to_minimap(m, x0, y0, s.pos.x, s.pos.z)
+		sx, sy := world_to_overview(m, x0, y0, s.pos.x, s.pos.z)
 		rl.DrawCircle(sx, sy, 3, TEAM_COLORS[s.team % len(TEAM_COLORS)])
 	}
 
-	cx, cy := world_to_minimap(m, x0, y0, camera.position.x, camera.position.z)
+	top_left := rl.GetScreenToWorld2D(rl.Vector2{0, 0}, camera)
+	bot_right := rl.GetScreenToWorld2D(rl.Vector2{f32(sw), f32(sh)}, camera)
 
-	fwd_x := camera.target.x - camera.position.x
-	fwd_z := camera.target.z - camera.position.z
-	flen := math.sqrt(fwd_x * fwd_x + fwd_z * fwd_z)
-	if flen > 0.001 {
-		fwd_x /= flen
-		fwd_z /= flen
-		rl.DrawLine(cx, cy, cx + i32(fwd_x * 14), cy + i32(fwd_z * 14), rl.YELLOW)
-	}
-	rl.DrawCircle(cx, cy, 4, rl.RED)
+	vx0, vy0 := world_to_overview(m, x0, y0, top_left.x, top_left.y)
+	vx1, vy1 := world_to_overview(m, x0, y0, bot_right.x, bot_right.y)
+	rl.DrawRectangleLines(vx0, vy0, vx1 - vx0, vy1 - vy0, rl.YELLOW)
 
 	label: cstring = "map"
 	rl.DrawText(label, x0 + 4, y0 - 20, 14, rl.Color{200, 200, 200, 255})
@@ -243,52 +291,34 @@ handle_timeline_click :: proc(w: ^World) -> bool {
 	return true
 }
 
-// Debug tool for figuring out the map's real "i" prop IDs: finds whichever
-// object/block projects closest to the center of the screen (i.e. roughly
-// what you're looking at) within a reasonable radius, and prints its raw
-// fields to the console. Use this to confirm or correct the barrel/crate
-// guess in models.odin -- look at a prop, press P, compare what prints to
-// what you see.
-debug_pick :: proc(m: ^GameMap, camera: rl.Camera3D, prop_models: ^PropModels) {
-	sw := f32(rl.GetScreenWidth())
-	sh := f32(rl.GetScreenHeight())
-	center := rl.Vector2{sw / 2, sh / 2}
+// Debug tool for figuring out the map's real "i" prop IDs (or just
+// inspecting any object): finds whichever object is closest to the mouse
+// cursor in world space, within a reasonable radius, and prints its raw
+// fields to the console.
+debug_pick :: proc(m: ^GameMap, camera: rl.Camera2D) {
+	mouse_world := rl.GetScreenToWorld2D(rl.GetMousePosition(), camera)
 
-	best_px_dist := f32(80) // ignore anything not roughly under the crosshair
+	best_dist := f32(40) // world units; ignore anything not roughly under the cursor
 	best_idx := -1
-	best_world_dist := max(f32)
 
 	for o, idx in m.objects {
-		dx := o.pos.x - camera.position.x
-		dy := o.pos.y - camera.position.y
-		dz := o.pos.z - camera.position.z
-		world_dist := math.sqrt(dx * dx + dy * dy + dz * dz)
-		if world_dist > 400 do continue
-
-		screen := rl.GetWorldToScreen(o.pos, camera)
-		px_dist := math.sqrt((screen.x - center.x) * (screen.x - center.x) + (screen.y - center.y) * (screen.y - center.y))
-		if px_dist < best_px_dist || (px_dist < best_px_dist + 5 && world_dist < best_world_dist) {
-			best_px_dist = px_dist
-			best_world_dist = world_dist
+		dx := o.pos.x - mouse_world.x
+		dz := o.pos.z - mouse_world.y
+		dist := math.sqrt(dx * dx + dz * dz)
+		if dist < best_dist {
+			best_dist = dist
 			best_idx = idx
 		}
 	}
 
 	if best_idx == -1 {
-		fmt.println("debug_pick: nothing under the crosshair within range")
+		fmt.println("debug_pick: nothing near the cursor within range")
 		return
 	}
 
 	o := m.objects[best_idx]
 	fmt.printf(
-		"debug_pick: object[%d]  pos=(%.1f, %.1f, %.1f)  t=%d  ci=%d  i=%d  world_dist=%.1f\n",
-		best_idx, o.pos.x, o.pos.y, o.pos.z, o.obj_type, o.color_i, o.prop_i, best_world_dist,
+		"debug_pick: object[%d]  pos=(%.1f, %.1f, %.1f)  t=%d  ci=%d  i=%d  v(hidden)=%v  drawn=%v  dist=%.1f\n",
+		best_idx, o.pos.x, o.pos.y, o.pos.z, o.obj_type, o.color_i, o.prop_i, o.hidden, should_draw_object(o), best_dist,
 	)
-	if o.prop_i >= 0 {
-		if _, has := prop_models[o.prop_i]; has {
-			fmt.println("  -> currently rendered with a real model loaded from the Krunker asset tree")
-		} else {
-			fmt.println("  -> no model mapped for this i value yet, rendered as a colored box")
-		}
-	}
 }
